@@ -14,6 +14,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Una dependencia de Expo exige Swift 6.2; seleccionamos el Xcode más nuevo
+      # del runner (que lo incluye) en vez del por defecto (Swift 6.1).
+      - name: Seleccionar Xcode más reciente
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Versiones de toolchain (debug)
+        run: |
+          xcodebuild -version
+          swift --version
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
