@@ -1,0 +1,64 @@
+name: iOS unsigned IPA
+
+# Genera un .ipa SIN firmar en un Mac de la nube. Luego lo firmas e instalas con
+# Sideloadly (Apple ID gratis). Dispáralo a mano desde la pestaña Actions, o con push.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias JS
+        run: npm ci
+
+      - name: Expo prebuild (genera el proyecto iOS y linkea el módulo Swift)
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: CocoaPods
+        working-directory: ios
+        run: pod install
+
+      - name: Compilar SIN firmar
+        run: |
+          set -eo pipefail
+          WORKSPACE=$(ls -d ios/*.xcworkspace | head -n1)
+          SCHEME=$(basename "$WORKSPACE" .xcworkspace)
+          echo "Workspace: $WORKSPACE   Scheme: $SCHEME"
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            clean build
+
+      - name: Empaquetar .ipa sin firmar
+        run: |
+          set -eo pipefail
+          APP=$(ls -d build/Build/Products/Release-iphoneos/*.app | head -n1)
+          echo "App: $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qr app-unsigned.ipa Payload
+          ls -lh app-unsigned.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-unsigned-ipa
+          path: app-unsigned.ipa
+          if-no-files-found: error
