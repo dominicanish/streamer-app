@@ -10,24 +10,26 @@
       <stop offset="1" stop-color="#00e0a4"/>
     </linearGradient>
     <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="18" result="b"/>
+      <feGaussianBlur stdDeviation="16" result="b"/>
       <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
   </defs>
 
   <rect width="1024" height="1024" fill="url(#bg)"/>
 
-  <!-- Barras de ecualizador (a juego con los VU de la app) -->
+  <!-- 5 barras simétricas, centradas vertical y horizontalmente (centro = 512,512) -->
   <g filter="url(#glow)" fill="url(#bar)">
-    <rect x="300" y="612" width="84" height="100" rx="42"/>
-    <rect x="420" y="452" width="84" height="420" rx="42"/>
-    <rect x="540" y="352" width="84" height="620" rx="42"/>
-    <rect x="660" y="512" width="84" height="300" rx="42"/>
+    <rect x="230" y="392" width="84" height="240" rx="42"/>
+    <rect x="350" y="282" width="84" height="460" rx="42"/>
+    <rect x="470" y="192" width="84" height="640" rx="42"/>
+    <rect x="590" y="282" width="84" height="460" rx="42"/>
+    <rect x="710" y="392" width="84" height="240" rx="42"/>
   </g>
   <g fill="url(#bar)">
-    <rect x="300" y="612" width="84" height="100" rx="42"/>
-    <rect x="420" y="452" width="84" height="420" rx="42"/>
-    <rect x="540" y="352" width="84" height="620" rx="42"/>
-    <rect x="660" y="512" width="84" height="300" rx="42"/>
+    <rect x="230" y="392" width="84" height="240" rx="42"/>
+    <rect x="350" y="282" width="84" height="460" rx="42"/>
+    <rect x="470" y="192" width="84" height="640" rx="42"/>
+    <rect x="590" y="282" width="84" height="460" rx="42"/>
+    <rect x="710" y="392" width="84" height="240" rx="42"/>
   </g>
 </svg>
