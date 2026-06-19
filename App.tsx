@@ -71,7 +71,7 @@ export default function App() {
     : stats?.paused ? 'Pausado'
     : !stats?.flow ? 'Silencio (en pausa)'
     : stats.serverPeak < 0.001 ? 'Silencio'
-    : stats.mutedPc ? 'Reproduciendo · PC mudo' : 'Reproduciendo';
+    : 'Reproduciendo';
 
   const dotColor = connected ? (stats && stats.flow ? C.good : C.warn)
     : connecting ? C.warn : C.bad;
