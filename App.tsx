@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import {
-  SafeAreaView, View, Text, TextInput, Pressable, ScrollView,
+  SafeAreaView, View, Text, TextInput, Pressable, ScrollView, Image,
   StyleSheet, StatusBar, Platform,
 } from 'react-native';
 import * as AudioStreamer from './modules/audio-streamer';
@@ -19,9 +19,11 @@ export default function App() {
   const [bufferMs, setBufferMs] = useState(100);
   const [connected, setConnected] = useState(false);
   const [stats, setStats] = useState<StatsEvent | null>(null);
+  const [artwork, setArtwork] = useState<string>('');
   const [logs, setLogs] = useState<LogLine[]>([]);
   const logId = useRef(0);
   const scroller = useRef<ScrollView>(null);
+  const paused = !!stats?.paused;
 
   function addLog(message: string, level = 'info') {
     const t = new Date().toLocaleTimeString('es', { hour12: false });
@@ -37,20 +39,24 @@ export default function App() {
       setConnected(e.connected);
     });
     const subLog = AudioStreamer.addLogListener((e: LogEvent) => addLog(e.message, e.level));
+    const subArt = AudioStreamer.addArtworkListener((dataUri) => setArtwork(dataUri));
     addLog('Listo. Escribe la IP del PC y pulsa Conectar.', 'info');
-    return () => { subStats.remove(); subLog.remove(); };
+    return () => { subStats.remove(); subLog.remove(); subArt.remove(); };
   }, []);
 
-  function toggleConnect() {
-    if (connected) {
-      AudioStreamer.disconnect();
-      setConnected(false);
-      setStats(null);
-      addLog('Desconectado', 'info');
-    } else {
-      AudioStreamer.connect(url.trim(), bufferMs);
-      setConnected(true);
-    }
+  function doConnect() {
+    AudioStreamer.connect(url.trim(), bufferMs);
+    setConnected(true);
+  }
+  function doDisconnect() {
+    AudioStreamer.disconnect();
+    setConnected(false);
+    setStats(null);
+    setArtwork('');
+    addLog('Desconectado', 'info');
+  }
+  function togglePause() {
+    if (paused) AudioStreamer.resume(); else AudioStreamer.pause();
   }
 
   function changeBuffer(delta: number) {
@@ -61,11 +67,12 @@ export default function App() {
 
   const audioState = !connected ? '—'
     : !stats ? 'Conectando…'
+    : paused ? 'Pausado'
     : !stats.flow ? 'Silencio (en pausa)'
     : stats.serverPeak < 0.001 ? 'Silencio'
     : stats.mutedPc ? 'Reproduciendo · PC mudo' : 'Reproduciendo';
 
-  const dotColor = !connected ? C.bad : (stats && stats.flow ? C.good : C.warn);
+  const dotColor = !connected ? C.bad : paused ? C.warn : (stats && stats.flow ? C.good : C.warn);
 
   return (
     <SafeAreaView style={st.root}>
@@ -96,9 +103,38 @@ export default function App() {
           />
         </View>
 
-        <Pressable style={[st.connect, connected && st.connectStop]} onPress={toggleConnect}>
-          <Text style={st.connectText}>{connected ? '■  Detener' : '▶  Conectar'}</Text>
-        </Pressable>
+        {!connected ? (
+          <Pressable style={st.connect} onPress={doConnect}>
+            <Text style={st.connectText}>▶  Conectar</Text>
+          </Pressable>
+        ) : (
+          <View style={{ gap: 10 }}>
+            <Pressable style={[st.connect, paused && st.connectResume]} onPress={togglePause}>
+              <Text style={st.connectText}>{paused ? '▶  Reanudar' : '❙❙  Pausar'}</Text>
+            </Pressable>
+            <Pressable style={st.stopBtn} onPress={doDisconnect}>
+              <Text style={st.stopBtnText}>■  Detener</Text>
+            </Pressable>
+          </View>
+        )}
+
+        {connected && (
+          <View style={[st.card, st.npCard]}>
+            {artwork ? (
+              <Image source={{ uri: artwork }} style={st.npArt} />
+            ) : (
+              <View style={[st.npArt, st.npArtEmpty]}><Text style={st.npNote}>♪</Text></View>
+            )}
+            <View style={st.npText}>
+              <Text style={st.npTitle} numberOfLines={2}>
+                {stats?.npTitle ? stats.npTitle : 'Audio del PC'}
+              </Text>
+              <Text style={st.npSub} numberOfLines={1}>
+                {stats?.npArtist || stats?.npApp || 'Sin información'}
+              </Text>
+            </View>
+          </View>
+        )}
 
         <View style={st.card}>
           <VU label="PC (origen)" value={stats?.serverPeak ?? 0} />
@@ -190,7 +226,17 @@ const st = StyleSheet.create({
   },
   connect: { backgroundColor: C.accent, borderRadius: 16, paddingVertical: 20, alignItems: 'center' },
   connectStop: { backgroundColor: C.bad },
+  connectResume: { backgroundColor: C.good },
   connectText: { color: '#fff', fontSize: 18, fontWeight: '700' },
+  stopBtn: { backgroundColor: C.card2, borderColor: C.border, borderWidth: 1, borderRadius: 14, paddingVertical: 12, alignItems: 'center' },
+  stopBtnText: { color: C.bad, fontSize: 15, fontWeight: '700' },
+  npCard: { flexDirection: 'row', alignItems: 'center', gap: 14 },
+  npArt: { width: 56, height: 56, borderRadius: 10, backgroundColor: C.card2 },
+  npArtEmpty: { alignItems: 'center', justifyContent: 'center' },
+  npNote: { color: C.accent, fontSize: 28, fontWeight: '700' },
+  npText: { flex: 1 },
+  npTitle: { color: C.text, fontSize: 15, fontWeight: '700' },
+  npSub: { color: C.dim, fontSize: 13, marginTop: 2 },
   row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   stepper: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   stepBtn: { backgroundColor: C.card2, borderRadius: 8, width: 40, height: 36, alignItems: 'center', justifyContent: 'center' },
