@@ -5,8 +5,8 @@ import UIKit
 import os
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Módulo Expo: connect/disconnect/setBufferMs + eventos. (Sin pausa: el teléfono
-// solo reproduce lo que el PC envía.)
+// Módulo Expo: connect/disconnect/setBufferMs + eventos. Sin botón de pausa en la
+// app; la pausa solo existe en el Dynamic Island / pantalla de bloqueo (local).
 // ─────────────────────────────────────────────────────────────────────────────
 public class AudioStreamerModule: Module {
   private let streamer = AudioStreamer()
@@ -38,9 +38,8 @@ public class AudioStreamerModule: Module {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AudioStreamer: WebSocket -> ring buffer -> AVAudioEngine, + Now Playing (solo
-// display). Handshake: no se reporta "connected" hasta recibir 'hello'; timeout
-// si el servidor no responde.
+// AudioStreamer: WebSocket -> ring buffer -> AVAudioEngine. Handshake con 'hello'
+// + timeout. Now Playing con play/pausa local (lo que activa el Dynamic Island).
 // ─────────────────────────────────────────────────────────────────────────────
 final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
 
@@ -68,12 +67,15 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
   // WebSocket / estado de conexión
   private var session: URLSession?
   private var task: URLSessionWebSocketTask?
-  private var receiving = false                 // ¿seguimos en el bucle de recepción?
+  private var receiving = false
   private var state = "disconnected"            // disconnected | connecting | connected | failed
   private var handshakeTimer: DispatchSourceTimer?
   private var commandsConfigured = false
 
-  // Now Playing (solo display)
+  // Pausa (local, desde el Dynamic Island)
+  private var isPaused = false
+
+  // Now Playing
   private var npTitle = ""
   private var npArtist = ""
   private var npApp = ""
@@ -115,6 +117,7 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
 
     if !startEngine() { setState("failed"); return }
 
+    isPaused = false
     npTitle = ""; npArtist = ""; npApp = ""; npArtwork = nil
     configureRemoteCommands()
     writeIdx = 0; readIdx = 0; playing = false; underruns = 0
@@ -134,18 +137,15 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
     startHandshakeTimeout()
   }
 
-  func disconnect() {
-    teardown()
-    setState("disconnected")
-  }
+  func disconnect() { teardown(); setState("disconnected") }
 
-  // Cierra todo SIN tocar el estado (lo fija quien llama).
   private func teardown() {
     receiving = false
     handshakeTimer?.cancel(); handshakeTimer = nil
     statsTimer?.cancel(); statsTimer = nil
     task?.cancel(with: .goingAway, reason: nil); task = nil
     session?.invalidateAndCancel(); session = nil
+    isPaused = false
     if engine.isRunning { engine.stop() }
     if let n = sourceNode { engine.detach(n); sourceNode = nil }
     DispatchQueue.main.async {
@@ -159,10 +159,7 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
     targetFrames = Int(sampleRate * max(20.0, min(1000.0, ms)) / 1000.0)
   }
 
-  private func setState(_ s: String) {
-    state = s
-    emitStats()
-  }
+  private func setState(_ s: String) { state = s; emitStats() }
 
   private func startHandshakeTimeout() {
     let timer = DispatchSource.makeTimerSource(queue: .global())
@@ -171,29 +168,54 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
       guard let self = self else { return }
       if self.state == "connecting" {
         self.onLog?("Sin respuesta del servidor (timeout). ¿IP correcta y servidor encendido?", "err")
-        self.teardown()
-        self.setState("failed")
+        self.teardown(); self.setState("failed")
       }
     }
     handshakeTimer = timer
     timer.resume()
   }
 
-  // ── Now Playing (solo display) ───────────────────────────────────────────────
+  // ── Pausa local (la activa el Dynamic Island) ────────────────────────────────
+  private func pause() {
+    if isPaused { return }
+    isPaused = true
+    DispatchQueue.main.async { if self.engine.isRunning { self.engine.pause() } }
+    updateNowPlaying(); emitStats()
+  }
+
+  private func resume() {
+    if !isPaused { return }
+    isPaused = false
+    os_unfair_lock_lock(&lock); writeIdx = 0; readIdx = 0; playing = false; os_unfair_lock_unlock(&lock)
+    DispatchQueue.main.async {
+      do { try self.engine.start() } catch { self.onLog?("No se pudo reanudar: \(error.localizedDescription)", "err") }
+    }
+    updateNowPlaying(); emitStats()
+  }
+
+  // ── Now Playing / Dynamic Island ─────────────────────────────────────────────
   private func configureRemoteCommands() {
     if commandsConfigured { return }
     commandsConfigured = true
-    // Sin controles: el teléfono solo refleja lo que el PC envía.
     let cc = MPRemoteCommandCenter.shared()
-    for cmd in [cc.playCommand, cc.pauseCommand, cc.togglePlayPauseCommand,
-                cc.nextTrackCommand, cc.previousTrackCommand,
-                cc.changePlaybackPositionCommand, cc.seekForwardCommand,
-                cc.seekBackwardCommand, cc.skipForwardCommand, cc.skipBackwardCommand] {
+    cc.playCommand.isEnabled = true
+    cc.pauseCommand.isEnabled = true
+    cc.togglePlayPauseCommand.isEnabled = true
+    cc.playCommand.addTarget { [weak self] _ in self?.resume(); return .success }
+    cc.pauseCommand.addTarget { [weak self] _ in self?.pause(); return .success }
+    cc.togglePlayPauseCommand.addTarget { [weak self] _ in
+      guard let self = self else { return .commandFailed }
+      if self.isPaused { self.resume() } else { self.pause() }
+      return .success
+    }
+    for cmd in [cc.nextTrackCommand, cc.previousTrackCommand, cc.changePlaybackPositionCommand,
+                cc.seekForwardCommand, cc.seekBackwardCommand, cc.skipForwardCommand, cc.skipBackwardCommand] {
       cmd.isEnabled = false
     }
   }
 
   private func updateNowPlaying() {
+    let paused = isPaused
     let title = npTitle.isEmpty ? "Audio del PC" : npTitle
     let subtitle = !npArtist.isEmpty ? npArtist : npApp
     let art = npArtwork
@@ -203,9 +225,9 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
       if !subtitle.isEmpty { info[MPMediaItemPropertyArtist] = subtitle }
       if let art = art { info[MPMediaItemPropertyArtwork] = art }
       info[MPNowPlayingInfoPropertyIsLiveStream] = true
-      info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+      info[MPNowPlayingInfoPropertyPlaybackRate] = paused ? 0.0 : 1.0
       MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-      MPNowPlayingInfoCenter.default().playbackState = .playing
+      MPNowPlayingInfoCenter.default().playbackState = paused ? .paused : .playing
     }
   }
 
@@ -292,6 +314,7 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
   }
 
   private func handlePCM(_ data: Data) {
+    if isPaused { return }
     let frames = (data.count / 2) / channels
     if frames == 0 { return }
     var peak: Float = 0
@@ -321,7 +344,6 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
           let type = obj["type"] as? String else { return }
     switch type {
     case "hello":
-      // Handshake confirmado: ahora sí estamos conectados de verdad.
       deviceName = obj["device"] as? String ?? ""
       mutedPc = obj["mutedPc"] as? Bool ?? false
       handshakeTimer?.cancel(); handshakeTimer = nil
@@ -374,6 +396,7 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
       "serverPeak": Double(serverPeak),
       "mutedPc": mutedPc,
       "flow": flow,
+      "paused": isPaused,
       "npTitle": npTitle,
       "npArtist": npArtist,
       "npApp": npApp,

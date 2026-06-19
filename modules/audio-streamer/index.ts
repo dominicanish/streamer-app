@@ -13,6 +13,7 @@ export type StatsEvent = {
   serverPeak: number;   // 0..1 nivel en el PC
   mutedPc: boolean;
   flow: boolean;        // ¿el servidor está enviando (no silencio)?
+  paused: boolean;      // ¿pausado desde el Dynamic Island?
   npTitle: string;      // "now playing": título
   npArtist: string;     // artista (o vacío)
   npApp: string;        // app fuente (Chrome, Spotify…)

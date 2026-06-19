@@ -68,6 +68,7 @@ export default function App() {
   const audioState = connecting ? 'Conectando…'
     : connState === 'failed' ? 'Sin conexión'
     : !connected ? '—'
+    : stats?.paused ? 'Pausado'
     : !stats?.flow ? 'Silencio (en pausa)'
     : stats.serverPeak < 0.001 ? 'Silencio'
     : stats.mutedPc ? 'Reproduciendo · PC mudo' : 'Reproduciendo';
