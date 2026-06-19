@@ -5,7 +5,8 @@ import UIKit
 import os
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Módulo Expo: connect/disconnect/setBufferMs/pause/resume + eventos.
+// Módulo Expo: connect/disconnect/setBufferMs + eventos. (Sin pausa: el teléfono
+// solo reproduce lo que el PC envía.)
 // ─────────────────────────────────────────────────────────────────────────────
 public class AudioStreamerModule: Module {
   private let streamer = AudioStreamer()
@@ -31,21 +32,23 @@ public class AudioStreamerModule: Module {
     }
     Function("disconnect") { self.streamer.disconnect() }
     Function("setBufferMs") { (ms: Double) in self.streamer.setBufferMs(ms) }
-    Function("pause") { self.streamer.pause() }
-    Function("resume") { self.streamer.resume() }
 
     OnDestroy { self.streamer.disconnect() }
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AudioStreamer: WebSocket -> ring buffer -> AVAudioEngine, + Now Playing/pausa.
+// AudioStreamer: WebSocket -> ring buffer -> AVAudioEngine, + Now Playing (solo
+// display). Handshake: no se reporta "connected" hasta recibir 'hello'; timeout
+// si el servidor no responde.
 // ─────────────────────────────────────────────────────────────────────────────
 final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
 
   var onLog: ((String, String) -> Void)?
   var onStats: (([String: Any]) -> Void)?
   var onArtwork: ((String) -> Void)?
+
+  private let handshakeTimeout: TimeInterval = 6.0
 
   // Audio
   private let engine = AVAudioEngine()
@@ -62,14 +65,15 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
   private var playing = false
   private var targetFrames = Int(48000 * 0.1)
 
-  // WebSocket
+  // WebSocket / estado de conexión
   private var session: URLSession?
   private var task: URLSessionWebSocketTask?
-  private var isConnected = false
-
-  // Estado de pausa / Now Playing
-  private var isPaused = false
+  private var receiving = false                 // ¿seguimos en el bucle de recepción?
+  private var state = "disconnected"            // disconnected | connecting | connected | failed
+  private var handshakeTimer: DispatchSourceTimer?
   private var commandsConfigured = false
+
+  // Now Playing (solo display)
   private var npTitle = ""
   private var npArtist = ""
   private var npApp = ""
@@ -93,8 +97,10 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
 
   // ── API ────────────────────────────────────────────────────────────────────
   func connect(urlString: String, bufferMs: Double) {
-    disconnect()
-    guard let url = URL(string: urlString) else { onLog?("URL inválida: \(urlString)", "err"); return }
+    teardown()
+    guard let url = URL(string: urlString) else {
+      setState("failed"); onLog?("URL inválida: \(urlString)", "err"); return
+    }
     setBufferMs(bufferMs)
 
     do {
@@ -107,34 +113,41 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
       onLog?("AVAudioSession error: \(error.localizedDescription)", "warn")
     }
 
-    if !startEngine() { return }
+    if !startEngine() { setState("failed"); return }
 
-    isPaused = false
     npTitle = ""; npArtist = ""; npApp = ""; npArtwork = nil
     configureRemoteCommands()
-    updateNowPlaying()                 // título por defecto → activa el Dynamic Island
+    writeIdx = 0; readIdx = 0; playing = false; underruns = 0
 
     let cfg = URLSessionConfiguration.default
-    cfg.waitsForConnectivity = true
+    cfg.waitsForConnectivity = false
+    cfg.timeoutIntervalForRequest = handshakeTimeout
     let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     let t = s.webSocketTask(with: url)
     session = s; task = t
-    isConnected = true
-    writeIdx = 0; readIdx = 0; playing = false; underruns = 0
+    receiving = true
+    setState("connecting")
+    onLog?("Conectando a \(urlString)…", "info")
     t.resume()
     receiveLoop()
     startStatsTimer()
-    onLog?("Conectando a \(urlString)…", "info")
+    startHandshakeTimeout()
   }
 
   func disconnect() {
-    isConnected = false
+    teardown()
+    setState("disconnected")
+  }
+
+  // Cierra todo SIN tocar el estado (lo fija quien llama).
+  private func teardown() {
+    receiving = false
+    handshakeTimer?.cancel(); handshakeTimer = nil
     statsTimer?.cancel(); statsTimer = nil
     task?.cancel(with: .goingAway, reason: nil); task = nil
     session?.invalidateAndCancel(); session = nil
     if engine.isRunning { engine.stop() }
     if let n = sourceNode { engine.detach(n); sourceNode = nil }
-    isPaused = false
     DispatchQueue.main.async {
       MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
       MPNowPlayingInfoCenter.default().playbackState = .stopped
@@ -146,58 +159,41 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
     targetFrames = Int(sampleRate * max(20.0, min(1000.0, ms)) / 1000.0)
   }
 
-  func pause() {
-    if isPaused { return }
-    isPaused = true
-    DispatchQueue.main.async { if self.engine.isRunning { self.engine.pause() } }
-    sendCommand("pause")               // también pausa la fuente en el PC (SMTC)
-    updateNowPlaying()
+  private func setState(_ s: String) {
+    state = s
     emitStats()
   }
 
-  func resume() {
-    if !isPaused { return }
-    isPaused = false
-    os_unfair_lock_lock(&lock); writeIdx = 0; readIdx = 0; playing = false; os_unfair_lock_unlock(&lock)
-    sendCommand("play")
-    DispatchQueue.main.async {
-      do { try self.engine.start() } catch { self.onLog?("No se pudo reanudar: \(error.localizedDescription)", "err") }
+  private func startHandshakeTimeout() {
+    let timer = DispatchSource.makeTimerSource(queue: .global())
+    timer.schedule(deadline: .now() + handshakeTimeout)
+    timer.setEventHandler { [weak self] in
+      guard let self = self else { return }
+      if self.state == "connecting" {
+        self.onLog?("Sin respuesta del servidor (timeout). ¿IP correcta y servidor encendido?", "err")
+        self.teardown()
+        self.setState("failed")
+      }
     }
-    updateNowPlaying()
-    emitStats()
+    handshakeTimer = timer
+    timer.resume()
   }
 
-  private func sendCommand(_ action: String) {
-    task?.send(.string("{\"type\":\"command\",\"action\":\"\(action)\"}")) { _ in }
-  }
-
-  // ── Now Playing / Dynamic Island ─────────────────────────────────────────────
+  // ── Now Playing (solo display) ───────────────────────────────────────────────
   private func configureRemoteCommands() {
     if commandsConfigured { return }
     commandsConfigured = true
+    // Sin controles: el teléfono solo refleja lo que el PC envía.
     let cc = MPRemoteCommandCenter.shared()
-    cc.playCommand.isEnabled = true
-    cc.pauseCommand.isEnabled = true
-    cc.togglePlayPauseCommand.isEnabled = true
-    cc.playCommand.addTarget { [weak self] _ in self?.resume(); return .success }
-    cc.pauseCommand.addTarget { [weak self] _ in self?.pause(); return .success }
-    cc.togglePlayPauseCommand.addTarget { [weak self] _ in
-      guard let self = self else { return .commandFailed }
-      if self.isPaused { self.resume() } else { self.pause() }
-      return .success
+    for cmd in [cc.playCommand, cc.pauseCommand, cc.togglePlayPauseCommand,
+                cc.nextTrackCommand, cc.previousTrackCommand,
+                cc.changePlaybackPositionCommand, cc.seekForwardCommand,
+                cc.seekBackwardCommand, cc.skipForwardCommand, cc.skipBackwardCommand] {
+      cmd.isEnabled = false
     }
-    // Sin next/prev/seek (solo pausa).
-    cc.nextTrackCommand.isEnabled = false
-    cc.previousTrackCommand.isEnabled = false
-    cc.changePlaybackPositionCommand.isEnabled = false
-    cc.seekForwardCommand.isEnabled = false
-    cc.seekBackwardCommand.isEnabled = false
-    cc.skipForwardCommand.isEnabled = false
-    cc.skipBackwardCommand.isEnabled = false
   }
 
   private func updateNowPlaying() {
-    let paused = isPaused
     let title = npTitle.isEmpty ? "Audio del PC" : npTitle
     let subtitle = !npArtist.isEmpty ? npArtist : npApp
     let art = npArtwork
@@ -207,18 +203,14 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
       if !subtitle.isEmpty { info[MPMediaItemPropertyArtist] = subtitle }
       if let art = art { info[MPMediaItemPropertyArtwork] = art }
       info[MPNowPlayingInfoPropertyIsLiveStream] = true
-      info[MPNowPlayingInfoPropertyPlaybackRate] = paused ? 0.0 : 1.0
+      info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
       MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-      MPNowPlayingInfoCenter.default().playbackState = paused ? .paused : .playing
+      MPNowPlayingInfoCenter.default().playbackState = .playing
     }
   }
 
   private func setArtwork(_ b64: String) {
-    if b64.isEmpty {
-      npArtwork = nil
-      onArtwork?("")
-      return
-    }
+    if b64.isEmpty { npArtwork = nil; onArtwork?(""); return }
     guard let data = Data(base64Encoded: b64), let img = UIImage(data: data) else {
       npArtwork = nil; onArtwork?(""); return
     }
@@ -277,23 +269,29 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
   // ── WebSocket ────────────────────────────────────────────────────────────────
   private func receiveLoop() {
     task?.receive { [weak self] result in
-      guard let self = self, self.isConnected else { return }
+      guard let self = self, self.receiving else { return }
       switch result {
       case .failure(let err):
-        self.onLog?("WS cerrado: \(err.localizedDescription)", "warn"); return
+        if self.state == "connecting" {
+          self.onLog?("No se pudo conectar: \(err.localizedDescription)", "err")
+          self.teardown(); self.setState("failed")
+        } else if self.state == "connected" {
+          self.onLog?("Conexión perdida: \(err.localizedDescription)", "warn")
+          self.teardown(); self.setState("disconnected")
+        }
+        return
       case .success(let message):
         switch message {
         case .data(let data): self.handlePCM(data)
         case .string(let text): self.handleControl(text)
         @unknown default: break
         }
-        if self.isConnected { self.receiveLoop() }
+        if self.receiving { self.receiveLoop() }
       }
     }
   }
 
   private func handlePCM(_ data: Data) {
-    if isPaused { return }            // pausado: descartamos
     let frames = (data.count / 2) / channels
     if frames == 0 { return }
     var peak: Float = 0
@@ -323,9 +321,14 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
           let type = obj["type"] as? String else { return }
     switch type {
     case "hello":
+      // Handshake confirmado: ahora sí estamos conectados de verdad.
       deviceName = obj["device"] as? String ?? ""
       mutedPc = obj["mutedPc"] as? Bool ?? false
-      onLog?("Servidor: \(deviceName)", "ok")
+      handshakeTimer?.cancel(); handshakeTimer = nil
+      if state != "connected" { onLog?("Conectado: \(deviceName)", "ok") }
+      configureRemoteCommands()
+      updateNowPlaying()
+      setState("connected")
     case "stats":
       serverPeak = Float(obj["serverPeak"] as? Double ?? 0)
     case "flow":
@@ -361,7 +364,8 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
     os_unfair_lock_unlock(&lock)
 
     onStats?([
-      "connected": isConnected,
+      "state": state,
+      "connected": state == "connected",
       "device": deviceName,
       "bufferMs": max(0, bufferMs),
       "underruns": underruns,
@@ -370,7 +374,6 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
       "serverPeak": Double(serverPeak),
       "mutedPc": mutedPc,
       "flow": flow,
-      "paused": isPaused,
       "npTitle": npTitle,
       "npArtist": npArtist,
       "npApp": npApp,
@@ -379,10 +382,10 @@ final class AudioStreamer: NSObject, URLSessionWebSocketDelegate {
 
   // ── Delegate ──────────────────────────────────────────────────────────────────
   func urlSession(_ s: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol p: String?) {
-    onLog?("WebSocket abierto", "ok")
+    onLog?("Socket abierto, esperando servidor…", "info")
   }
   func urlSession(_ s: URLSession, webSocketTask: URLSessionWebSocketTask,
                   didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
-    onLog?("WebSocket cerrado", "warn")
+    if state == "connecting" { teardown(); setState("failed") }
   }
 }

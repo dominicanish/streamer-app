@@ -4,7 +4,7 @@ import {
   StyleSheet, StatusBar, Platform,
 } from 'react-native';
 import * as AudioStreamer from './modules/audio-streamer';
-import type { StatsEvent, LogEvent } from './modules/audio-streamer';
+import type { StatsEvent, LogEvent, ConnState } from './modules/audio-streamer';
 
 const C = {
   bg: '#0a0b0f', card: '#14161d', card2: '#1b1e27', border: '#262a36',
@@ -17,13 +17,14 @@ type LogLine = { id: number; t: string; message: string; level: string };
 export default function App() {
   const [url, setUrl] = useState('ws://10.0.0.121:8080');
   const [bufferMs, setBufferMs] = useState(100);
-  const [connected, setConnected] = useState(false);
+  const [connState, setConnState] = useState<ConnState>('disconnected');
   const [stats, setStats] = useState<StatsEvent | null>(null);
   const [artwork, setArtwork] = useState<string>('');
   const [logs, setLogs] = useState<LogLine[]>([]);
   const logId = useRef(0);
   const scroller = useRef<ScrollView>(null);
-  const paused = !!stats?.paused;
+  const connected = connState === 'connected';
+  const connecting = connState === 'connecting';
 
   function addLog(message: string, level = 'info') {
     const t = new Date().toLocaleTimeString('es', { hour12: false });
@@ -36,7 +37,8 @@ export default function App() {
   useEffect(() => {
     const subStats = AudioStreamer.addStatsListener((e: StatsEvent) => {
       setStats(e);
-      setConnected(e.connected);
+      setConnState(e.state);
+      if (e.state !== 'connected') setArtwork('');
     });
     const subLog = AudioStreamer.addLogListener((e: LogEvent) => addLog(e.message, e.level));
     const subArt = AudioStreamer.addArtworkListener((dataUri) => setArtwork(dataUri));
@@ -45,18 +47,16 @@ export default function App() {
   }, []);
 
   function doConnect() {
+    setConnState('connecting');        // optimista; el handshake lo confirma
+    setStats(null);
     AudioStreamer.connect(url.trim(), bufferMs);
-    setConnected(true);
   }
   function doDisconnect() {
     AudioStreamer.disconnect();
-    setConnected(false);
+    setConnState('disconnected');
     setStats(null);
     setArtwork('');
     addLog('Desconectado', 'info');
-  }
-  function togglePause() {
-    if (paused) AudioStreamer.resume(); else AudioStreamer.pause();
   }
 
   function changeBuffer(delta: number) {
@@ -65,14 +65,18 @@ export default function App() {
     if (connected) AudioStreamer.setBufferMs(v);
   }
 
-  const audioState = !connected ? '—'
-    : !stats ? 'Conectando…'
-    : paused ? 'Pausado'
-    : !stats.flow ? 'Silencio (en pausa)'
+  const audioState = connecting ? 'Conectando…'
+    : connState === 'failed' ? 'Sin conexión'
+    : !connected ? '—'
+    : !stats?.flow ? 'Silencio (en pausa)'
     : stats.serverPeak < 0.001 ? 'Silencio'
     : stats.mutedPc ? 'Reproduciendo · PC mudo' : 'Reproduciendo';
 
-  const dotColor = !connected ? C.bad : paused ? C.warn : (stats && stats.flow ? C.good : C.warn);
+  const dotColor = connected ? (stats && stats.flow ? C.good : C.warn)
+    : connecting ? C.warn : C.bad;
+  const subText = connected ? (stats?.device || 'Conectado')
+    : connecting ? 'Conectando…'
+    : connState === 'failed' ? 'Sin conexión' : 'Desconectado';
 
   return (
     <SafeAreaView style={st.root}>
@@ -83,7 +87,7 @@ export default function App() {
             <View style={[st.dot, { backgroundColor: dotColor }]} />
             <View>
               <Text style={st.title}>PC → Speaker</Text>
-              <Text style={st.sub}>{connected ? (stats?.device || 'Conectado') : 'Desconectado'}</Text>
+              <Text style={st.sub}>{subText}</Text>
             </View>
           </View>
         </View>
@@ -94,7 +98,7 @@ export default function App() {
             style={st.input}
             value={url}
             onChangeText={setUrl}
-            editable={!connected}
+            editable={!connected && !connecting}
             autoCapitalize="none"
             autoCorrect={false}
             keyboardType="url"
@@ -103,20 +107,15 @@ export default function App() {
           />
         </View>
 
-        {!connected ? (
-          <Pressable style={st.connect} onPress={doConnect}>
-            <Text style={st.connectText}>▶  Conectar</Text>
-          </Pressable>
-        ) : (
-          <View style={{ gap: 10 }}>
-            <Pressable style={[st.connect, paused && st.connectResume]} onPress={togglePause}>
-              <Text style={st.connectText}>{paused ? '▶  Reanudar' : '❙❙  Pausar'}</Text>
-            </Pressable>
-            <Pressable style={st.stopBtn} onPress={doDisconnect}>
-              <Text style={st.stopBtnText}>■  Detener</Text>
-            </Pressable>
-          </View>
-        )}
+        <Pressable
+          style={[st.connect, connected && st.connectStop, connecting && st.connectDim]}
+          disabled={connecting}
+          onPress={connected ? doDisconnect : doConnect}
+        >
+          <Text style={st.connectText}>
+            {connected ? '■  Detener' : connecting ? 'Conectando…' : '▶  Conectar'}
+          </Text>
+        </Pressable>
 
         {connected && (
           <View style={[st.card, st.npCard]}>
@@ -226,10 +225,8 @@ const st = StyleSheet.create({
   },
   connect: { backgroundColor: C.accent, borderRadius: 16, paddingVertical: 20, alignItems: 'center' },
   connectStop: { backgroundColor: C.bad },
-  connectResume: { backgroundColor: C.good },
+  connectDim: { backgroundColor: C.card2 },
   connectText: { color: '#fff', fontSize: 18, fontWeight: '700' },
-  stopBtn: { backgroundColor: C.card2, borderColor: C.border, borderWidth: 1, borderRadius: 14, paddingVertical: 12, alignItems: 'center' },
-  stopBtnText: { color: C.bad, fontSize: 15, fontWeight: '700' },
   npCard: { flexDirection: 'row', alignItems: 'center', gap: 14 },
   npArt: { width: 56, height: 56, borderRadius: 10, backgroundColor: C.card2 },
   npArtEmpty: { alignItems: 'center', justifyContent: 'center' },
